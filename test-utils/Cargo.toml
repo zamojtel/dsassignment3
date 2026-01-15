@@ -1,0 +1,20 @@
+[package]
+name = "assignment-3-test-utils"
+version = "0.2.0"
+authors = ["Filip Plata <fp371335@students.mimuw.edu.pl>", "Wojciech Ciszewski <w.ciszewski2@student.uw.edu.pl>", "Maciej Matraszek <m.matraszek@mimuw.edu.pl>"]
+edition = "2024"
+
+[dependencies]
+uuid = { version = "1.19", features = ["v4", "serde"] }
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+async-trait = "0.1"
+tokio = { version = "1.48", features = ["full"] }
+log = "0.4"
+rand = "0.9"
+module_system = { path = "../../la1/solution", package = "assignment-1-solution" }
+assignment-3-solution = { path = "../solution" }
+
+[lib]
+name = "assignment_3_test_utils"
+path = "lib.rs"

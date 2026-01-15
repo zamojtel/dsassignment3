@@ -1,0 +1,19 @@
+[package]
+name = "assignment-3-public-tests"
+version = "0.2.1"
+authors = ["Filip Plata <fp371335@students.mimuw.edu.pl>", "Wojciech Ciszewski <w.ciszewski2@student.uw.edu.pl>", "Maciej Matraszek <m.matraszek@mimuw.edu.pl>"]
+edition = "2024"
+
+[dev-dependencies]
+uuid = { version = "1.19", features = ["v4", "serde"] }
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+async-trait = "0.1"
+tokio = { version = "1.48", features = ["full", "test-util"] }
+log = "0.4"
+rand = "0.9"
+module_system = { path = "../../la1/solution", package = "assignment-1-solution" }
+assignment-3-solution = { path = "../solution" }
+assignment-3-test-utils = { path = "../test-utils" }
+
+ntest = "0.9.3"
