@@ -7,6 +7,11 @@ mod domain;
 #[non_exhaustive]
 pub struct Raft {
     // TODO you can add fields to this struct.
+    // Persistant
+    current_term: u64,
+    logs: Vec<LogEntry>,
+    // Volatile
+    commit_index: u64,
 }
 
 impl Raft {
