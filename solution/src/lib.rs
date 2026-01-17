@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, hash::Hash, time::Duration};
 
 use module_system::{Handler, ModuleRef, System};
 use serde::{Serialize, Deserialize};
@@ -42,6 +42,7 @@ pub struct Raft {
     // Volatile
     commit_index: usize,
     leader_id: Option<Uuid>,
+    response_channels: HashMap<usize,UnboundedSender<ClientRequestResponse>>
 }
 
 impl Raft {
@@ -79,6 +80,7 @@ impl Raft {
             leader_id: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
+            response_channels: HashMap::new(),
 
             last_applied: 0,
             commit_index: 0,
@@ -103,7 +105,35 @@ impl Handler<RaftMessage> for Raft {
 #[async_trait::async_trait]
 impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, msg: ClientRequest) {
-        todo!()
+        match msg.content {
+            ClientRequestContent::Command{command,client_id,sequence_num,lowest_sequence_num_without_response} => {
+                if self.role == RaftRole::Leader {
+                    // append to logs
+                    let content = LogEntryContent::Command { data: command, client_id, sequence_num, lowest_sequence_num_without_response }
+                    let log_entry = LogEntry{
+                        content,
+                        term: self.current_term,
+                        timestamp: timestamp: SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default(), 
+                    }
+
+                    self.logs.push(log_entry);
+                    self.response_channels.insert(self.logs.len()-1, msg.reply_to)
+                }else{
+                    // what happens when we are not a leader
+                    let response = ClientRequestResponse::CommandResponse(
+                        CommandResponseArgs { 
+                            client_id,
+                            sequence_num,
+                            content: CommandResponseContent::NotLeader { leader_hint: self.leader_id },
+                        }
+                    );
+                    msg.reply_to.send(response).expect("failed to send response");
+                }
+            },
+            _ => todo!("More types of requests"),
+        }
     }
 }
 
