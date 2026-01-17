@@ -1,17 +1,47 @@
+use std::{collections::HashMap, time::Duration};
+
 use module_system::{Handler, ModuleRef, System};
+use serde::{Serialize, Deserialize};
 
 pub use domain::*;
 
 mod domain;
 
+#[derive(Serialize, Deserialize)]
+pub struct PersistentState{
+    current_term: u64,
+    voted_for: Option<Uuid>,
+    logs: Vec<LogEntry>,
+}
+
+// roles
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaftRole{
+    Follower,
+    Candidate,
+    Leader,
+}
+
 #[non_exhaustive]
 pub struct Raft {
     // TODO you can add fields to this struct.
-    // Persistant
+    // passed fields
+    id: Uuid,
+    role: RaftRole,
+    state_machine: Box<dyn StateMachine>,
+    stable_storage: Box<dyn StableStorage>,
+    message_sender: Box<dyn RaftSender>,
+    // Persistent
     current_term: u64,
     logs: Vec<LogEntry>,
+    voted_for: Option<Uuid>,
+    next_index: HashMap<Uuid,usize>,
+    // max replicated index for a process
+    match_index: HashMap<Uuid,usize>,
+    last_applied: usize,
     // Volatile
-    commit_index: u64,
+    commit_index: usize,
+    leader_id: Option<Uuid>,
 }
 
 impl Raft {
@@ -24,7 +54,42 @@ impl Raft {
         stable_storage: Box<dyn StableStorage>,
         message_sender: Box<dyn RaftSender>,
     ) -> ModuleRef<Self> {
-        todo!()
+        let initial_entry = LogEntry{
+            term: 0,
+            timestamp: Duration::from_secs(0),
+            content: LogEntryContent::Configuration { 
+                servers: config.servers.clone(),  
+            }
+        };
+        let (current_term,voted_for,logs) = match stable_storage.get("persistent_state").await {
+            Some(bytes) => {
+                let state: PersistentState = decode_from_slice(&bytes).expect("could not read from stable storage!");
+                (state.current_term,state.voted_for,state.logs)
+            },
+            None => {
+                (0,None,vec![initial_entry])
+            },
+        };
+        let raft_node = Self{
+            current_term,
+            logs,
+            voted_for,
+
+            role: RaftRole::Follower,
+            leader_id: None,
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
+
+            last_applied: 0,
+            commit_index: 0,
+            id: config.self_id,
+
+            stable_storage,
+            state_machine,
+            message_sender,
+        };
+
+        system.register_module(move |_ref| raft_node).await
     }
 }
 
