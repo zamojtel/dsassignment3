@@ -98,7 +98,109 @@ impl Raft {
 #[async_trait::async_trait]
 impl Handler<RaftMessage> for Raft {
     async fn handle(&mut self, msg: RaftMessage) {
-        todo!()
+        if msg.header.term > self.current_term {
+            self.current_term = msg.header.term;
+            self.voted_for = None;
+            self.role = RaftRole::Follower;
+            self.leader_id = None;
+        };
+
+        match msg.content {
+            RaftMessageContent::AppendEntriesRequest{term,leader_id,prev_log_index,prev_log_term,entries,leader_commit} => {
+            },
+            RaftMessageContent::AppendEntries(args) => {
+                
+                let log_ok = self.logs.get(args.prev_log_index)
+                .map(|entry| entry.term == args.prev_log_term)
+                .unwrap_or(false);
+
+                if !log_ok {
+                    let response = RaftMessage {
+                        header: RaftMessageHeader {
+                            term: self.current_term,
+                            source: self.id,
+                        },
+                        content: RaftMessageContent::AppendEntriesResponse(
+                            AppendEntriesResponseArgs {
+                                success: false,
+                                last_verified_log_index: args.entries.len() + args.prev_log_index,
+                            }
+                        ),
+                    };
+
+                    self.message_sender.send(&msg.header.source, response).await;
+                }else{
+                    //success
+                    let entries_len = args.entries.len();  
+                    for (i, entry) in args.entries.into_iter().enumerate() {
+                        let log_index = args.prev_log_index + 1 + (i as u64);
+                        let number_of_logs = self.logs.len() as u64;
+                        if log_index < number_of_logs {
+                            if self.logs[log_index as usize].term != entry.term {
+                                self.logs.truncate(log_index as usize);
+                                self.logs.push(entry);
+                            }
+                            // it is there and it suits 
+                            // we do nothing 
+                        }else{
+                            self.logs.push(entry);
+                        }
+                    }
+
+
+                    let index_of_last_new_entry = args.prev_log_index + entries_len as u64;
+                    if args.leader_commit > self.commit_index{
+                        self.commit_index = std::cmp::min(args.leader_commit as usize, index_of_last_new_entry as usize);
+                    }
+
+                    let response = RaftMessage {
+                        header: RaftMessageHeader {
+                            term: self.current_term,
+                            source: self.id,
+                        },
+                        content: RaftMessageContent::AppendEntriesResponse(
+                            AppendEntriesResponseArgs {
+                                success: true,
+                                last_verified_log_index: index_of_last_new_entry as usize,
+                            }
+                        ),
+                    };
+
+                    self.message_sender.send(&msg.header.source, response).await;
+
+                }
+            },
+            RaftMessageContent::RequestVoteRequest{term,candidate_id,last_log_index,last_log_term} => {
+            
+            },
+            RaftMessageContent::RequestVote(args) => {
+                let candidate_id = msg.header.source;
+                let entry = self.logs.last().unwrap();
+                let my_last_log_index = self.logs.len()-1;
+                let log_ok = entry.term < args.last_log_term || (entry.term == args.last_log_term && my_last_log_index <= args.last_log_index);
+                
+                let vote_granted = (self.voted_for.is_none() || self.voted_for == Some(candidate_id)) && log_ok;
+                
+                if vote_granted {
+                    self.voted_for = Some(candidate_id);
+                }
+
+                let response = RaftMessage {
+                    header: RaftMessageHeader {
+                        term: self.current_term,
+                        source: self.id, 
+                    },
+                    content: RaftMessageContent::RequestVoteResponse(
+                        RequestVoteResponseArgs {
+                            vote_granted,
+                        }
+                    ),
+                };
+
+                self.message_sender.send(&candidate_id, response).await;
+            }
+            _ => todo!(),
+        }
     }
 }
 
@@ -109,14 +211,14 @@ impl Handler<ClientRequest> for Raft {
             ClientRequestContent::Command{command,client_id,sequence_num,lowest_sequence_num_without_response} => {
                 if self.role == RaftRole::Leader {
                     // append to logs
-                    let content = LogEntryContent::Command { data: command, client_id, sequence_num, lowest_sequence_num_without_response }
+                    let content = LogEntryContent::Command { data: command, client_id, sequence_num, lowest_sequence_num_without_response };
                     let log_entry = LogEntry{
                         content,
                         term: self.current_term,
-                        timestamp: timestamp: SystemTime::now()
+                        timestamp:SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap_or_default(), 
-                    }
+                    };
 
                     self.logs.push(log_entry);
                     self.response_channels.insert(self.logs.len()-1, msg.reply_to)
