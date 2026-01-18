@@ -1,4 +1,9 @@
-use std::{collections::{HashMap, HashSet}, hash::Hash, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet}};
+use tokio::time::{Duration, Instant};
+use uuid::Uuid;
+use tokio::sync::mpsc::UnboundedSender;
+use std::ops::RangeInclusive;
+use rand::Rng;
 
 use module_system::{Handler, ModuleRef, System};
 use serde::{Serialize, Deserialize};
@@ -45,9 +50,10 @@ pub struct Raft {
     // Volatile
     commit_index: usize,
     leader_id: Option<Uuid>,
-    response_channels: HashMap<usize,UnboundedSender<ClientRequestResponse>>
+    response_channels: HashMap<usize,UnboundedSender<ClientRequestResponse>>,
 
     // Konfiguracja (przepisana z ServerConfig w new)
+    system_boot_time: Instant,
     election_timeout_range: RangeInclusive<Duration>,
     heartbeat_timeout: Duration,
 
@@ -85,7 +91,7 @@ impl Raft {
             },
         };
 
-        let raft_node = Self{
+        let mut raft_node = Self {
             current_term,
             logs,
             voted_for,
@@ -95,6 +101,8 @@ impl Raft {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             response_channels: HashMap::new(),
+            
+            votes_received: HashSet::new(), 
 
             last_applied: 0,
             commit_index: 0,
@@ -105,10 +113,11 @@ impl Raft {
             stable_storage,
             state_machine,
             message_sender,
-
+            
             election_timeout_range: config.election_timeout_range.clone(),
             heartbeat_timeout: config.heartbeat_timeout,
             
+            system_boot_time: config.system_boot_time,
             election_deadline: Instant::now(),
             heartbeat_deadline: Instant::now(),
         };
@@ -117,7 +126,7 @@ impl Raft {
 
        let self_ref = system.register_module(move |_ref| raft_node).await;
 
-        let mut ticker_ref = self_ref.clone();
+        let ticker_ref = self_ref.clone();
         tokio::spawn(
             async move {
                 let interval = Duration::from_millis(10);
@@ -201,7 +210,7 @@ impl Raft {
         let last_log_index = self.logs.len().saturating_sub(1);
         let last_log_term = self.logs.last().map(|e| e.term).unwrap_or(0);
 
-        for peer_id in &mut self.peers{
+        for peer_id in &self.peers{
             if *peer_id == self.id {
                 continue;
             }
@@ -239,6 +248,51 @@ impl Raft {
         let timeout = rng.random_range(self.election_timeout_range.clone());
         self.election_deadline = Instant::now() + timeout;
     }
+
+    async fn apply_committed_entries(&mut self) {
+        while self.commit_index > self.last_applied {
+            self.last_applied += 1;
+            let log_index = self.last_applied;
+            
+            // Pobieramy wpis (zakładamy, że logi są spójne i indeks istnieje)
+            // Używamy clone(), bo entry.content będziemy move-ować do maszyny stanów lub pattern matchować
+            let entry = self.logs[log_index].clone();
+
+            match entry.content {
+                LogEntryContent::Command { data, client_id, sequence_num, .. } => {
+                    // 1. Aplikujemy do maszyny stanów
+                    let output = self.state_machine.apply(&data).await;
+
+                    // 2. Jeśli jesteśmy Liderem, odpowiadamy Klientowi
+                    // Sprawdzamy, czy mamy kanał dla tego konkretnego indeksu logu
+                    if let Some(sender) = self.response_channels.remove(&log_index) {
+                        let response = ClientRequestResponse::CommandResponse(
+                            CommandResponseArgs {
+                                client_id,
+                                sequence_num,
+                                content: CommandResponseContent::CommandApplied { output },
+                            }
+                        );
+                        //error is ignored
+                        let _ = sender.send(response);
+                    }
+                },
+                LogEntryContent::RegisterClient => {
+                    if let Some(sender) = self.response_channels.remove(&log_index) {
+                        let response = ClientRequestResponse::RegisterClientResponse(
+                            RegisterClientResponseArgs {
+                                content: RegisterClientResponseContent::ClientRegistered {
+                                    client_id: Uuid::from_u128(log_index as u128),
+                                },
+                            }
+                        );
+                        let _ = sender.send(response);
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -265,11 +319,56 @@ impl Handler<RaftMessage> for Raft {
                             self.leader_id = Some(self.id);
                             self.become_leader();
                             self.broadcast_append_entries().await;
+                        }
                     }
                 }
+            },
+            RaftMessageContent::AppendEntriesResponse(args) => {
+                if self.role == RaftRole::Leader {
+                    if args.success {
+                        // 1. Aktualizujemy wiedzę o postępach followera
+                        let follower_id = msg.header.source;
+                        
+                        // match_index - co na pewno ma
+                        let current_match = *self.match_index.get(&follower_id).unwrap_or(&0);
+                        let new_match = std::cmp::max(current_match, args.last_verified_log_index);
+                        self.match_index.insert(follower_id, new_match);
 
-            }
-            RaftMessageContent::AppendEntriesRequest{term,leader_id,prev_log_index,prev_log_term,entries,leader_commit} => {
+                        let new_next = new_match + 1;
+                        self.next_index.insert(follower_id, new_next);
+
+                        // 2. Sprawdzamy, czy możemy zwiększyć commit_index
+                        // Szukamy takiego N, które jest > commit_index, i które ma większość w match_index
+                        // oraz self.logs[N].term == self.current_term (Lider nie może commitować logów z poprzednich kadencji przez liczenie)
+                        
+                        // Sortujemy match_indexes, żeby znaleźć medianę (punkt większości)
+                        let mut match_indexes: Vec<usize> = self.match_index.values().cloned().collect();
+                        match_indexes.push(self.logs.len() - 1); // Dodajemy siebie (Lidera)
+                        match_indexes.sort_unstable();
+
+                        // Bierzemy element, który jest "po środku" (większość ma co najmniej tyle)
+                        // Dla 3 serwerów: indices[0, 1, 2] -> index 1 to ten, który ma większość (2 serwery)
+                        let majority_index = match_indexes.len() / 2; 
+                        let potential_commit_index = match_indexes[majority_index];
+
+                        if potential_commit_index > self.commit_index {
+                            let entry_term = self.logs.get(potential_commit_index).map(|e| e.term).unwrap_or(0);
+                            if entry_term == self.current_term {
+                                self.commit_index = potential_commit_index;
+                                self.apply_committed_entries().await;
+                            }
+                        }
+                    } else {
+                        let follower_id = msg.header.source;
+                        let current_next = *self.next_index.get(&follower_id).unwrap_or(&(self.logs.len()));
+
+                        let new_next = std::cmp::max(1, current_next.saturating_sub(1));
+                        self.next_index.insert(follower_id, new_next);
+                        
+                        // Opcjonalnie: ponów wysyłkę od razu (przyspiesza catch-up)
+                        // self.broadcast_append_entries().await; 
+                    }
+                }
             },
             RaftMessageContent::AppendEntries(args) => {
                 if msg.header.term >= self.current_term {
@@ -304,8 +403,8 @@ impl Handler<RaftMessage> for Raft {
                     //success
                     let entries_len = args.entries.len();  
                     for (i, entry) in args.entries.into_iter().enumerate() {
-                        let log_index = args.prev_log_index + 1 + (i as u64);
-                        let number_of_logs = self.logs.len() as u64;
+                        let log_index = args.prev_log_index + 1 + i;
+                        let number_of_logs = self.logs.len() ;
                         if log_index < number_of_logs {
                             if self.logs[log_index as usize].term != entry.term {
                                 self.logs.truncate(log_index as usize);
@@ -322,9 +421,10 @@ impl Handler<RaftMessage> for Raft {
                         self.save_state().await;
                     }
                     
-                    let index_of_last_new_entry = args.prev_log_index + entries_len as u64;
+                    let index_of_last_new_entry = args.prev_log_index + entries_len;
                     if args.leader_commit > self.commit_index{
                         self.commit_index = std::cmp::min(args.leader_commit as usize, index_of_last_new_entry as usize);
+                        self.apply_committed_entries().await;
                     }
 
                     let response = RaftMessage {
@@ -342,9 +442,6 @@ impl Handler<RaftMessage> for Raft {
 
                     self.message_sender.send(&msg.header.source, response).await;
                 }
-            },
-            RaftMessageContent::RequestVoteRequest{term,candidate_id,last_log_index,last_log_term} => {
-            
             },
             RaftMessageContent::RequestVote(args) => {
                 let candidate_id = msg.header.source;
@@ -381,27 +478,34 @@ impl Handler<RaftMessage> for Raft {
             _ => todo!(),
         }
     }
-    }
 }
+
 #[async_trait::async_trait]
 impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, msg: ClientRequest) {
+        let now = Instant::now();
+        let entry_timestamp = now.duration_since(self.system_boot_time);
+
+
         match msg.content {
             ClientRequestContent::Command{command,client_id,sequence_num,lowest_sequence_num_without_response} => {
                 if self.role == RaftRole::Leader {
-                    // append to logs
-                    let content = LogEntryContent::Command { data: command, client_id, sequence_num, lowest_sequence_num_without_response };
                     let log_entry = LogEntry{
-                        content,
                         term: self.current_term,
-                        timestamp:SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default(), 
+                        timestamp: entry_timestamp,
+                        content:
+                        LogEntryContent::Command {
+                            data: command,
+                            client_id,
+                            sequence_num,
+                            lowest_sequence_num_without_response
+                        },
                     };
 
                     self.logs.push(log_entry);
+                    self.save_state().await;
                     self.response_channels.insert(self.logs.len()-1, msg.reply_to);   
-                    
+                    self.broadcast_append_entries().await;
                 }else{
                     // what happens when we are not a leader
                     let response = ClientRequestResponse::CommandResponse(
@@ -411,10 +515,34 @@ impl Handler<ClientRequest> for Raft {
                             content: CommandResponseContent::NotLeader { leader_hint: self.leader_id },
                         }
                     );
-                    msg.reply_to.send(response).expect("failed to send response");
+                    let _ = msg.reply_to.send(response).expect("failed to send response");
                 }
             },
-            _ => todo!("More types of requests"),
+            ClientRequestContent::RegisterClient => {
+                if self.role == RaftRole::Leader {
+
+                    let log_entry = LogEntry {
+                        term:self.current_term,
+                        timestamp: entry_timestamp,
+                        content: LogEntryContent::RegisterClient
+                    };
+
+                    self.logs.push(log_entry);
+
+                    self.save_state().await;
+
+                    self.response_channels.insert(self.logs.len()-1, msg.reply_to);
+                    self.broadcast_append_entries().await;
+                }else{
+                    let response = ClientRequestResponse::RegisterClientResponse(
+                        RegisterClientResponseArgs {
+                            content: RegisterClientResponseContent::NotLeader { leader_hint: self.leader_id },
+                        }
+                    );
+                    let _ = msg.reply_to.send(response);
+                }
+            }
+            _ => {},
         }
     }
 }
