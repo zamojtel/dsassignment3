@@ -41,6 +41,7 @@ pub struct Raft {
     last_applied: usize,
     append_entries_batch_size: usize,
     peers: HashSet<Uuid>,
+    votes_received: std::collections::HashSet<Uuid>,
     // Volatile
     commit_index: usize,
     leader_id: Option<Uuid>,
@@ -133,6 +134,39 @@ impl Raft {
         }
     }
 
+    fn start_election(&mut self) {
+        self.role = RaftRole::Candidate;
+
+        self.current_term += 1;
+
+        self.voted_for = Some(self.id);
+        self.votes_received.clear();
+        self.votes_received.insert(self.id);    
+
+        // for safety 
+        let last_log_index = self.logs.len().saturating_sub(1);
+        let last_log_term = self.logs.last().map(|e| e.term).unwrap_or(0);
+
+        for peer_id in &mut self.peers{
+            if *peer_id == self.id {
+                continue;
+            }
+
+            let msg = RaftMessage {
+                header: RaftMessageHeader {
+                    source: self.id,
+                    term: self.current_term,
+                },
+                content: RaftMessageContent::RequestVote(RequestVoteArgs {
+                    last_log_index,
+                    last_log_term,
+                }),
+            };
+
+            self.message_sender.send(peer_id, msg).await;
+        }
+    }
+
     fn become_leader(&mut self) {
         let next_idx = self.logs.len();
 
@@ -159,7 +193,20 @@ impl Handler<RaftMessage> for Raft {
         match msg.content {
             RaftMessageContent::RequestVoteResponse(args) => {
 
-                
+                if self.role == RaftRole::Candidate {
+                    if args.vote_granted {
+                        self.votes_received.insert(msg.header.source);
+
+                        let majority = (self.peers.len() / 2) + 1;
+
+                        if self.votes_received.len() >= majority {
+                            self.role = RaftRole::Leader;
+                            self.leader_id = Some(self.id);
+                            self.become_leader();
+                            self.broadcast_append_entries().await;
+                    }
+                }
+
             }
             RaftMessageContent::AppendEntriesRequest{term,leader_id,prev_log_index,prev_log_term,entries,leader_commit} => {
             },
