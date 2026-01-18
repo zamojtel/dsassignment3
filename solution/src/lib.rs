@@ -1,4 +1,4 @@
-use std::{collections::HashMap, hash::Hash, time::Duration};
+use std::{collections::{HashMap, HashSet}, hash::Hash, time::Duration};
 
 use module_system::{Handler, ModuleRef, System};
 use serde::{Serialize, Deserialize};
@@ -39,6 +39,8 @@ pub struct Raft {
     // max replicated index for a process
     match_index: HashMap<Uuid,usize>,
     last_applied: usize,
+    append_entries_batch_size: usize,
+    peers: HashSet<Uuid>,
     // Volatile
     commit_index: usize,
     leader_id: Option<Uuid>,
@@ -85,13 +87,62 @@ impl Raft {
             last_applied: 0,
             commit_index: 0,
             id: config.self_id,
+            peers: config.servers,
 
+            append_entries_batch_size: config.append_entries_batch_size,
             stable_storage,
             state_machine,
             message_sender,
         };
 
         system.register_module(move |_ref| raft_node).await
+    }
+
+    async fn broadcast_append_entries(&mut self) {
+        for (peer_id,&peer_next_index) in &self.next_index {
+            if *peer_id == self.id {
+                continue;
+            }
+
+            let prev_log_index = peer_next_index - 1;
+            let prev_log_term = self.logs.get(prev_log_index)
+            .map(|entry| entry.term )
+            .unwrap_or(0);
+
+            let entries_to_send: Vec<LogEntry> = self.logs.iter()
+            .skip(peer_next_index)
+            .take(self.append_entries_batch_size)
+            .cloned()
+            .collect();
+
+            let response = RaftMessage {
+                header: RaftMessageHeader { 
+                    source: self.id,
+                    term: self.current_term,
+                },
+                content: RaftMessageContent::AppendEntries(
+                    AppendEntriesArgs {
+                    prev_log_index,
+                    prev_log_term,
+                    entries: entries_to_send,
+                    leader_commit: self.commit_index,
+                })
+            };
+
+            self.message_sender.send(peer_id, response).await;
+        }
+    }
+
+    fn become_leader(&mut self) {
+        let next_idx = self.logs.len();
+
+        self.next_index.clear();
+        self.match_index.clear();
+
+        for peer_id in &self.peers {
+            self.next_index.insert(*peer_id, next_idx);
+            self.match_index.insert(*peer_id, 0);
+        }
     }
 }
 
@@ -106,6 +157,10 @@ impl Handler<RaftMessage> for Raft {
         };
 
         match msg.content {
+            RaftMessageContent::RequestVoteResponse(args) => {
+
+                
+            }
             RaftMessageContent::AppendEntriesRequest{term,leader_id,prev_log_index,prev_log_term,entries,leader_commit} => {
             },
             RaftMessageContent::AppendEntries(args) => {
@@ -221,7 +276,8 @@ impl Handler<ClientRequest> for Raft {
                     };
 
                     self.logs.push(log_entry);
-                    self.response_channels.insert(self.logs.len()-1, msg.reply_to)
+                    self.response_channels.insert(self.logs.len()-1, msg.reply_to);   
+                    
                 }else{
                     // what happens when we are not a leader
                     let response = ClientRequestResponse::CommandResponse(
