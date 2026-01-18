@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, hash::Hash, time::Duration};
+use std::{collections::{HashMap, HashSet}, hash::Hash, time::{Duration, Instant}};
 
 use module_system::{Handler, ModuleRef, System};
 use serde::{Serialize, Deserialize};
@@ -46,6 +46,16 @@ pub struct Raft {
     commit_index: usize,
     leader_id: Option<Uuid>,
     response_channels: HashMap<usize,UnboundedSender<ClientRequestResponse>>
+
+    // Konfiguracja (przepisana z ServerConfig w new)
+    election_timeout_range: RangeInclusive<Duration>,
+    heartbeat_timeout: Duration,
+
+    // Stan czasowy (Volatile)
+    // Kiedy nastąpi najbliższa elekcja (jeśli nie dostaniemy wiadomości)?
+    election_deadline: Instant,
+    // Kiedy jako Leader mamy wysłać kolejny heartbeat?
+    heartbeat_deadline: Instant,
 }
 
 impl Raft {
@@ -74,6 +84,7 @@ impl Raft {
                 (0,None,vec![initial_entry])
             },
         };
+
         let raft_node = Self{
             current_term,
             logs,
@@ -94,9 +105,42 @@ impl Raft {
             stable_storage,
             state_machine,
             message_sender,
+
+            election_timeout_range: config.election_timeout_range.clone(),
+            heartbeat_timeout: config.heartbeat_timeout,
+            
+            election_deadline: Instant::now(),
+            heartbeat_deadline: Instant::now(),
         };
 
-        system.register_module(move |_ref| raft_node).await
+        raft_node.reset_election_timer();
+
+       let self_ref = system.register_module(move |_ref| raft_node).await;
+
+        let mut ticker_ref = self_ref.clone();
+        tokio::spawn(
+            async move {
+                let interval = Duration::from_millis(10);
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let _ = ticker_ref.send(Timeout).await;
+                }
+            }
+        );
+
+        self_ref
+    }
+
+    async fn save_state(&mut self) {
+        let state = PersistentState {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+            logs: self.logs.clone(),
+        };
+
+        if let Ok(bytes) = encode_to_vec(&state) {
+            let _ = self.stable_storage.put("persistent_state", &bytes).await;
+        }
     }
 
     async fn broadcast_append_entries(&mut self) {
@@ -134,14 +178,24 @@ impl Raft {
         }
     }
 
-    fn start_election(&mut self) {
+    async fn start_election(&mut self) {
         self.role = RaftRole::Candidate;
 
         self.current_term += 1;
 
         self.voted_for = Some(self.id);
         self.votes_received.clear();
-        self.votes_received.insert(self.id);    
+        self.votes_received.insert(self.id);
+
+        let state = PersistentState {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+            logs: self.logs.clone(),
+        };
+
+        if let Ok(bytes) = encode_to_vec(&state) {
+            let _ = self.stable_storage.put("persistent_state", &bytes).await;
+        }
 
         // for safety 
         let last_log_index = self.logs.len().saturating_sub(1);
@@ -178,6 +232,13 @@ impl Raft {
             self.match_index.insert(*peer_id, 0);
         }
     }
+
+    fn reset_election_timer(&mut self) {
+        let mut rng = rand::rng();
+        
+        let timeout = rng.random_range(self.election_timeout_range.clone());
+        self.election_deadline = Instant::now() + timeout;
+    }
 }
 
 #[async_trait::async_trait]
@@ -211,7 +272,15 @@ impl Handler<RaftMessage> for Raft {
             RaftMessageContent::AppendEntriesRequest{term,leader_id,prev_log_index,prev_log_term,entries,leader_commit} => {
             },
             RaftMessageContent::AppendEntries(args) => {
-                
+                if msg.header.term >= self.current_term {
+                    self.reset_election_timer();
+                    self.leader_id = Some(msg.header.source);
+                    if self.role == RaftRole::Candidate {
+                        self.role = RaftRole::Follower;
+                    }
+
+                }
+
                 let log_ok = self.logs.get(args.prev_log_index)
                 .map(|entry| entry.term == args.prev_log_term)
                 .unwrap_or(false);
@@ -249,7 +318,10 @@ impl Handler<RaftMessage> for Raft {
                         }
                     }
 
-
+                    if entries_len > 0 {
+                        self.save_state().await;
+                    }
+                    
                     let index_of_last_new_entry = args.prev_log_index + entries_len as u64;
                     if args.leader_commit > self.commit_index{
                         self.commit_index = std::cmp::min(args.leader_commit as usize, index_of_last_new_entry as usize);
@@ -269,7 +341,6 @@ impl Handler<RaftMessage> for Raft {
                     };
 
                     self.message_sender.send(&msg.header.source, response).await;
-
                 }
             },
             RaftMessageContent::RequestVoteRequest{term,candidate_id,last_log_index,last_log_term} => {
@@ -277,14 +348,21 @@ impl Handler<RaftMessage> for Raft {
             },
             RaftMessageContent::RequestVote(args) => {
                 let candidate_id = msg.header.source;
+
                 let entry = self.logs.last().unwrap();
                 let my_last_log_index = self.logs.len()-1;
                 let log_ok = entry.term < args.last_log_term || (entry.term == args.last_log_term && my_last_log_index <= args.last_log_index);
                 
-                let vote_granted = (self.voted_for.is_none() || self.voted_for == Some(candidate_id)) && log_ok;
+                let term_ok = msg.header.term >= self.current_term;
+
+
+                let vote_granted = (self.voted_for.is_none() || self.voted_for == Some(candidate_id)) && log_ok && term_ok;
                 
                 if vote_granted {
                     self.voted_for = Some(candidate_id);
+                    self.reset_election_timer();
+
+                    self.save_state().await;
                 }
 
                 let response = RaftMessage {
@@ -298,14 +376,13 @@ impl Handler<RaftMessage> for Raft {
                         }
                     ),
                 };
-
                 self.message_sender.send(&candidate_id, response).await;
             }
             _ => todo!(),
         }
     }
+    }
 }
-
 #[async_trait::async_trait]
 impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, msg: ClientRequest) {
@@ -343,3 +420,31 @@ impl Handler<ClientRequest> for Raft {
 }
 
 // TODO you can implement handlers of messages of other types for the Raft struct.
+
+// internal message for ticking timeouts
+struct Timeout;
+
+#[async_trait::async_trait]
+impl Handler<Timeout> for Raft {
+    async fn handle(&mut self, _: Timeout) {
+        let now = Instant::now();
+
+        match self.role {
+            RaftRole::Leader => {
+                // as leader we only worry about heartbeats
+                if now >= self.heartbeat_deadline {
+                    self.broadcast_append_entries().await;
+                    self.heartbeat_deadline = now + self.heartbeat_timeout;
+                }
+            }
+            RaftRole::Follower | RaftRole::Candidate => {
+                if now >= self.election_deadline {
+                    // after timeout we start election
+                    self.start_election().await;
+                    
+                    self.reset_election_timer();
+                }
+            }
+        }
+    }
+}
