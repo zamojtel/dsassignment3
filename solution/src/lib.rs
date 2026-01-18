@@ -52,16 +52,13 @@ pub struct Raft {
     leader_id: Option<Uuid>,
     response_channels: HashMap<usize,UnboundedSender<ClientRequestResponse>>,
 
-    // Konfiguracja (przepisana z ServerConfig w new)
     system_boot_time: Instant,
     election_timeout_range: RangeInclusive<Duration>,
     heartbeat_timeout: Duration,
-
-    // Stan czasowy (Volatile)
-    // Kiedy nastąpi najbliższa elekcja (jeśli nie dostaniemy wiadomości)?
     election_deadline: Instant,
-    // Kiedy jako Leader mamy wysłać kolejny heartbeat?
     heartbeat_deadline: Instant,
+    last_leader_contact: Instant,
+    last_heartbeat_response: HashMap<Uuid, Instant>,
 }
 
 impl Raft {
@@ -103,12 +100,11 @@ impl Raft {
             response_channels: HashMap::new(),
             
             votes_received: HashSet::new(), 
-
             last_applied: 0,
             commit_index: 0,
             id: config.self_id,
             peers: config.servers,
-
+            
             append_entries_batch_size: config.append_entries_batch_size,
             stable_storage,
             state_machine,
@@ -116,10 +112,11 @@ impl Raft {
             
             election_timeout_range: config.election_timeout_range.clone(),
             heartbeat_timeout: config.heartbeat_timeout,
-            
             system_boot_time: config.system_boot_time,
             election_deadline: Instant::now(),
             heartbeat_deadline: Instant::now(),
+            last_leader_contact: Instant::now(),
+            last_heartbeat_response: HashMap::new(),
         };
 
         raft_node.reset_election_timer();
@@ -191,7 +188,6 @@ impl Raft {
         self.role = RaftRole::Candidate;
 
         self.current_term += 1;
-
         self.voted_for = Some(self.id);
         self.votes_received.clear();
         self.votes_received.insert(self.id);
@@ -230,7 +226,18 @@ impl Raft {
         }
     }
 
-    fn become_leader(&mut self) {
+    async fn become_leader(&mut self) {
+        let now = tokio::time::Instant::now();
+        let entry_timestamp = now.duration_since(self.system_boot_time);
+        
+        let no_op_entry = LogEntry {
+            term: self.current_term,
+            timestamp: entry_timestamp,
+            content: LogEntryContent::NoOp,
+        };
+        
+        self.logs.push(no_op_entry);
+
         let next_idx = self.logs.len();
 
         self.next_index.clear();
@@ -254,17 +261,13 @@ impl Raft {
             self.last_applied += 1;
             let log_index = self.last_applied;
             
-            // Pobieramy wpis (zakładamy, że logi są spójne i indeks istnieje)
-            // Używamy clone(), bo entry.content będziemy move-ować do maszyny stanów lub pattern matchować
             let entry = self.logs[log_index].clone();
 
             match entry.content {
                 LogEntryContent::Command { data, client_id, sequence_num, .. } => {
-                    // 1. Aplikujemy do maszyny stanów
+
                     let output = self.state_machine.apply(&data).await;
 
-                    // 2. Jeśli jesteśmy Liderem, odpowiadamy Klientowi
-                    // Sprawdzamy, czy mamy kanał dla tego konkretnego indeksu logu
                     if let Some(sender) = self.response_channels.remove(&log_index) {
                         let response = ClientRequestResponse::CommandResponse(
                             CommandResponseArgs {
@@ -297,17 +300,26 @@ impl Raft {
 
 #[async_trait::async_trait]
 impl Handler<RaftMessage> for Raft {
-    async fn handle(&mut self, msg: RaftMessage) {
+async fn handle(&mut self, msg: RaftMessage) {
+        if let RaftMessageContent::RequestVote(_) = &msg.content {
+            let min_election_timeout = *self.election_timeout_range.start();
+            let is_leader_alive = self.last_leader_contact.elapsed() < min_election_timeout;
+            
+            if self.role == RaftRole::Leader || (self.leader_id.is_some() && is_leader_alive) {
+                return; 
+            }
+        }
+
         if msg.header.term > self.current_term {
             self.current_term = msg.header.term;
             self.voted_for = None;
             self.role = RaftRole::Follower;
-            self.leader_id = None;
+            self.leader_id = None; 
+            self.save_state().await;
         };
 
         match msg.content {
             RaftMessageContent::RequestVoteResponse(args) => {
-
                 if self.role == RaftRole::Candidate {
                     if args.vote_granted {
                         self.votes_received.insert(msg.header.source);
@@ -317,19 +329,53 @@ impl Handler<RaftMessage> for Raft {
                         if self.votes_received.len() >= majority {
                             self.role = RaftRole::Leader;
                             self.leader_id = Some(self.id);
-                            self.become_leader();
+     
+                            self.become_leader().await; 
+                            self.save_state().await;
                             self.broadcast_append_entries().await;
                         }
                     }
                 }
             },
+            RaftMessageContent::RequestVote(args) => {
+                let candidate_id = msg.header.source;
+
+                let my_last_log_idx = self.logs.len().saturating_sub(1);
+                let my_last_log_term = self.logs.last().map(|e| e.term).unwrap_or(0);
+
+                let log_is_ok = (args.last_log_term > my_last_log_term) ||
+                                (args.last_log_term == my_last_log_term && args.last_log_index >= my_last_log_idx);
+
+                let term_is_ok = msg.header.term == self.current_term;
+                let can_vote = self.voted_for.is_none() || self.voted_for == Some(candidate_id);
+
+                let vote_granted = term_is_ok && can_vote && log_is_ok;
+
+                if vote_granted {
+                    self.voted_for = Some(candidate_id);
+                    self.reset_election_timer();
+                    self.save_state().await;
+                }
+
+                let response = RaftMessage {
+                    header: RaftMessageHeader {
+                        term: self.current_term,
+                        source: self.id,
+                    },
+                    content: RaftMessageContent::RequestVoteResponse(
+                        RequestVoteResponseArgs {
+                            vote_granted,
+                        }
+                    ),
+                };
+                self.message_sender.send(&candidate_id, response).await;
+            },
             RaftMessageContent::AppendEntriesResponse(args) => {
                 if self.role == RaftRole::Leader {
+                    let follower_id = msg.header.source;
+                    self.last_heartbeat_response.insert(follower_id, tokio::time::Instant::now());
+                    
                     if args.success {
-                        // 1. Aktualizujemy wiedzę o postępach followera
-                        let follower_id = msg.header.source;
-                        
-                        // match_index - co na pewno ma
                         let current_match = *self.match_index.get(&follower_id).unwrap_or(&0);
                         let new_match = std::cmp::max(current_match, args.last_verified_log_index);
                         self.match_index.insert(follower_id, new_match);
@@ -337,17 +383,10 @@ impl Handler<RaftMessage> for Raft {
                         let new_next = new_match + 1;
                         self.next_index.insert(follower_id, new_next);
 
-                        // 2. Sprawdzamy, czy możemy zwiększyć commit_index
-                        // Szukamy takiego N, które jest > commit_index, i które ma większość w match_index
-                        // oraz self.logs[N].term == self.current_term (Lider nie może commitować logów z poprzednich kadencji przez liczenie)
-                        
-                        // Sortujemy match_indexes, żeby znaleźć medianę (punkt większości)
                         let mut match_indexes: Vec<usize> = self.match_index.values().cloned().collect();
-                        match_indexes.push(self.logs.len() - 1); // Dodajemy siebie (Lidera)
+                        match_indexes.push(self.logs.len() - 1); 
                         match_indexes.sort_unstable();
 
-                        // Bierzemy element, który jest "po środku" (większość ma co najmniej tyle)
-                        // Dla 3 serwerów: indices[0, 1, 2] -> index 1 to ten, który ma większość (2 serwery)
                         let majority_index = match_indexes.len() / 2; 
                         let potential_commit_index = match_indexes[majority_index];
 
@@ -359,14 +398,11 @@ impl Handler<RaftMessage> for Raft {
                             }
                         }
                     } else {
-                        let follower_id = msg.header.source;
                         let current_next = *self.next_index.get(&follower_id).unwrap_or(&(self.logs.len()));
-
                         let new_next = std::cmp::max(1, current_next.saturating_sub(1));
                         self.next_index.insert(follower_id, new_next);
                         
-                        // Opcjonalnie: ponów wysyłkę od razu (przyspiesza catch-up)
-                        // self.broadcast_append_entries().await; 
+                        self.broadcast_append_entries().await;
                     }
                 }
             },
@@ -377,12 +413,12 @@ impl Handler<RaftMessage> for Raft {
                     if self.role == RaftRole::Candidate {
                         self.role = RaftRole::Follower;
                     }
-
+                    self.last_leader_contact = tokio::time::Instant::now();
                 }
 
                 let log_ok = self.logs.get(args.prev_log_index)
-                .map(|entry| entry.term == args.prev_log_term)
-                .unwrap_or(false);
+                    .map(|entry| entry.term == args.prev_log_term)
+                    .unwrap_or(false);
 
                 if !log_ok {
                     let response = RaftMessage {
@@ -393,26 +429,21 @@ impl Handler<RaftMessage> for Raft {
                         content: RaftMessageContent::AppendEntriesResponse(
                             AppendEntriesResponseArgs {
                                 success: false,
-                                last_verified_log_index: args.entries.len() + args.prev_log_index,
+                                last_verified_log_index: self.logs.len(), // hint
                             }
                         ),
                     };
-
                     self.message_sender.send(&msg.header.source, response).await;
-                }else{
-                    //success
-                    let entries_len = args.entries.len();  
+                } else {
+                    let entries_len = args.entries.len();
                     for (i, entry) in args.entries.into_iter().enumerate() {
-                        let log_index = args.prev_log_index + 1 + i;
-                        let number_of_logs = self.logs.len() ;
-                        if log_index < number_of_logs {
-                            if self.logs[log_index as usize].term != entry.term {
-                                self.logs.truncate(log_index as usize);
+                        let target_idx = args.prev_log_index + 1 + i;
+                        if target_idx < self.logs.len() {
+                            if self.logs[target_idx].term != entry.term {
+                                self.logs.truncate(target_idx);
                                 self.logs.push(entry);
                             }
-                            // it is there and it suits 
-                            // we do nothing 
-                        }else{
+                        } else {
                             self.logs.push(entry);
                         }
                     }
@@ -422,7 +453,7 @@ impl Handler<RaftMessage> for Raft {
                     }
                     
                     let index_of_last_new_entry = args.prev_log_index + entries_len;
-                    if args.leader_commit > self.commit_index{
+                    if args.leader_commit > self.commit_index {
                         self.commit_index = std::cmp::min(args.leader_commit as usize, index_of_last_new_entry as usize);
                         self.apply_committed_entries().await;
                     }
@@ -439,43 +470,10 @@ impl Handler<RaftMessage> for Raft {
                             }
                         ),
                     };
-
                     self.message_sender.send(&msg.header.source, response).await;
                 }
             },
-            RaftMessageContent::RequestVote(args) => {
-                let candidate_id = msg.header.source;
-
-                let entry = self.logs.last().unwrap();
-                let my_last_log_index = self.logs.len()-1;
-                let log_ok = entry.term < args.last_log_term || (entry.term == args.last_log_term && my_last_log_index <= args.last_log_index);
-                
-                let term_ok = msg.header.term >= self.current_term;
-
-
-                let vote_granted = (self.voted_for.is_none() || self.voted_for == Some(candidate_id)) && log_ok && term_ok;
-                
-                if vote_granted {
-                    self.voted_for = Some(candidate_id);
-                    self.reset_election_timer();
-
-                    self.save_state().await;
-                }
-
-                let response = RaftMessage {
-                    header: RaftMessageHeader {
-                        term: self.current_term,
-                        source: self.id, 
-                    },
-                    content: RaftMessageContent::RequestVoteResponse(
-                        RequestVoteResponseArgs {
-                            vote_granted,
-                        }
-                    ),
-                };
-                self.message_sender.send(&candidate_id, response).await;
-            }
-            _ => todo!(),
+            _ => { },
         }
     }
 }
@@ -485,7 +483,6 @@ impl Handler<ClientRequest> for Raft {
     async fn handle(&mut self, msg: ClientRequest) {
         let now = Instant::now();
         let entry_timestamp = now.duration_since(self.system_boot_time);
-
 
         match msg.content {
             ClientRequestContent::Command{command,client_id,sequence_num,lowest_sequence_num_without_response} => {
@@ -559,17 +556,40 @@ impl Handler<Timeout> for Raft {
 
         match self.role {
             RaftRole::Leader => {
-                // as leader we only worry about heartbeats
+                // 1. Wysyłanie Heartbeatów (to już powinieneś mieć)
                 if now >= self.heartbeat_deadline {
                     self.broadcast_append_entries().await;
                     self.heartbeat_deadline = now + self.heartbeat_timeout;
                 }
+
+                // 2. NOWOŚĆ: Sprawdź, czy załoga wciąż z nami jest!
+                // Specyfikacja: "If election timeout elapses without successful round of heartbeats..."
+                
+                // Używamy np. dolnej granicy timeoutu wyborczego jako limitu cierpliwości
+                let election_timeout = *self.election_timeout_range.start();
+                
+                // Liczymy głosy (siebie liczymy zawsze jako 1)
+                let mut active_nodes = 1; 
+                
+                for peer_id in &self.peers {
+                    if let Some(last_ack) = self.last_heartbeat_response.get(peer_id) {
+                        if now.duration_since(*last_ack) < election_timeout {
+                            active_nodes += 1;
+                        }
+                    }
+                }
+
+                let majority = (self.peers.len() / 2) + 1;
+                
+                if active_nodes < majority {
+                    self.role = RaftRole::Follower;
+                    self.leader_id = None;
+                    self.save_state().await;
+                }
             }
             RaftRole::Follower | RaftRole::Candidate => {
                 if now >= self.election_deadline {
-                    // after timeout we start election
                     self.start_election().await;
-                    
                     self.reset_election_timer();
                 }
             }
